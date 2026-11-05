@@ -29,13 +29,19 @@ async def repair_thread(
     graph: Pregel, config: RunnableConfig, translator: StreamTranslator, reason: str
 ) -> None:
     """`reason` is "stopped" (the user pressed stop) or "error" (the graph raised)."""
-    """After a stop or failure: keep the partial answer, and answer any tool calls that never
-    got a result (providers reject a history with unanswered tool calls)."""
+    """After a stop or failure: save what the main agent finished but the thread doesn't have
+    yet (an agent running inside a node only hands its messages over when the node ends),
+    keep the partial answer, and answer tool calls that never got a result (providers
+    reject a history with unanswered tool calls)."""
     try:
         state = await graph.aget_state(config)
-        messages = (state.values or {}).get("messages") or []
+        saved = (state.values or {}).get("messages") or []
+        saved_ids = {m.id for m in saved}
+        missing = [m for m in translator.main_messages() if m.id not in saved_ids]
+        messages = [*saved, *missing]
         answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
-        fixes: list[Any] = [
+        fixes: list[Any] = list(missing)
+        fixes += [
             ToolMessage(
                 content="Not run: the reply was "
                 + ("stopped" if reason == "stopped" else "interrupted by an error")

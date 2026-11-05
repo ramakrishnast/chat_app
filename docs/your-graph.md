@@ -3,31 +3,39 @@
 The backend runs whatever graph `GRAPH` points to. Start from
 `backend/agents/example/graph.py` (a supervisor with two tools and a `writer` subagent).
 
-## The contract, in four rules
+## The shape: one node, one supervisor
 
-1. **State has `messages`.** Use `MessagesState` or a subclass. The app sends each user
-   turn as `{"messages": [HumanMessage(...)]}` and keeps the history in the checkpointer
-   per thread, so nodes see the whole conversation in `state["messages"]`. Extra state keys
-   are fine.
-2. **Get the LLM from `get_model(config)`**, never construct one in a node:
+```python
+from langchain.agents import create_agent
+from langgraph.graph import START, MessagesState, StateGraph
+from agentkit import UseChatModel, default_model, subagent_tool
 
-   ```python
-   from agentkit import get_model
+supervisor = create_agent(
+    model=default_model(),              # placeholder; UseChatModel swaps in the UI's pick
+    tools=[search, calculator, subagent_tool(researcher, name="researcher",
+                                             description="...")],
+    system_prompt="You coordinate tools and specialists...",
+    middleware=[UseChatModel(), SummarizationMiddleware(...), ModelRetryMiddleware()],
+    name="supervisor",
+)
 
-   async def supervisor(state: MessagesState, config: RunnableConfig) -> dict:
-       model = get_model(config).bind_tools(TOOLS)
-       reply = await model.ainvoke([SystemMessage(PROMPT), *state["messages"]], config)
-       return {"messages": [reply]}
-   ```
+builder = StateGraph(MessagesState)
+builder.add_node("supervisor", supervisor)
+builder.add_edge(START, "supervisor")
+```
 
-   That is the model picked in the UI (Ollama now; OpenAI/Anthropic once a key is set) with
-   the Think switch applied. `get_model(config, thinking=False)` forces thinking off, e.g.
-   for a quick routing call.
-3. **Pass `config` along** to every model call and sub-graph (`ainvoke(..., config)`).
-   That is what makes tokens stream and keeps subagents on the same model.
-4. **Export the uncompiled builder** (`builder = StateGraph(...)`) or a compiled graph. The
-   app compiles or copies it with its own Postgres checkpointer. A zero-argument factory
-   (sync or async) also works, e.g. `GRAPH=my_agents.legal:make_graph`.
+Tools and middleware go on the supervisor; add more nodes to `builder` only when you need
+steps around it. The app needs four things:
+
+1. **State has `messages`** (`MessagesState` or a subclass). The app sends each user turn as
+   `{"messages": [HumanMessage(...)]}` and keeps the history in the checkpointer per thread.
+2. **`UseChatModel()` in every agent's middleware.** It runs each model call on the model
+   picked in the UI (Ollama now; OpenAI/Anthropic once a key is set) with the Think switch
+   applied. In a hand-written node, call `get_model(config)` instead.
+3. **Subagents wrapped with `subagent_tool(...)`** (below), so their work shows under the
+   tool call that started them.
+4. **Export the uncompiled `builder`** or a compiled graph. The app compiles or copies it
+   with its own Postgres checkpointer. A zero-argument factory (sync or async) also works.
 
 ## Subagents
 
@@ -36,7 +44,8 @@ Wrap a compiled subagent as a tool for the supervisor:
 ```python
 from agentkit import subagent_tool
 
-researcher = research_builder.compile(name="researcher")
+researcher = create_agent(model=default_model(), tools=[search_cases],
+                          middleware=[UseChatModel()], name="researcher")
 TOOLS = [
     search_cases,
     subagent_tool(researcher, name="researcher",
@@ -50,8 +59,6 @@ and they are still there after a reload (its transcript is stored as the tool me
 artifact). A subgraph you invoke yourself inside a plain tool also streams; with several
 calls running in parallel, `subagent_tool` is what keeps each one under the right card.
 
-A compiled agent added directly as a node (`builder.add_node("agent", create_agent(...))`)
-also works: its output is treated as the main answer.
 
 ## Keeping your graph in its own repo
 

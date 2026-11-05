@@ -14,7 +14,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from agentkit.subagents import PARENT_TOOL_CALL_KEY, SUBAGENT_KEY
 
@@ -71,6 +71,9 @@ class StreamTranslator:
         self._ns_parent: dict[tuple[str, ...], str] = {}
         self._main_text: dict[str, str] = {}  # message id -> streamed answer text
         self._completed: set[str] = set()  # message ids that reached the graph state
+        # Finished messages of the main agent (not subagents), in order. When the agent runs
+        # inside a node, these reach the thread only when that node ends, so a stop needs them.
+        self._main_messages: dict[str, BaseMessage] = {}
         self.last_root_node: str | None = None
 
     # -------------------------------------------------------------- attribution
@@ -155,9 +158,12 @@ class StreamTranslator:
             if node == "__interrupt__":
                 events.append({"type": "interrupt", "value": json.dumps(update, default=str)})
                 continue
+            main = self._parent(ns) is None
             for message in _messages_in(update):
                 if message.id:
                     self._completed.add(message.id)
+                    if main and not isinstance(message, HumanMessage):
+                        self._main_messages.setdefault(message.id, message)
                 if isinstance(message, AIMessage):
                     events += self._tool_calls_of(ns, node, message)
                 elif isinstance(message, ToolMessage):
@@ -206,6 +212,10 @@ class StreamTranslator:
         ]
 
     # -------------------------------------------------------------- stop support
+
+    def main_messages(self) -> list[BaseMessage]:
+        """Messages the main agent finished during this run, in order."""
+        return list(self._main_messages.values())
 
     def unfinished_answer(self) -> tuple[str, str] | None:
         """(message id, text) of answer text that streamed but never reached the state."""

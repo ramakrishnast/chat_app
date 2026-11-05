@@ -101,11 +101,23 @@ test("an error event keeps the error status through done", () => {
   expect(m).toMatchObject({ status: "error", error: "boom" });
 });
 
-test("top-level steps drive the progress label", () => {
-  const step = { step_id: "1", node: "tools", ...at };
-  const m = run({ type: "step_start", ...step });
-  expect(m.step).toBe("tools");
-  expect(applyEvent(m, { type: "step_end", ...step, error: null }).step).toBeNull();
-  const nested = applyEvent(start, { type: "step_start", ...step, ns: ["tools"] });
-  expect(nested.step).toBeUndefined();
+test("the progress label follows the innermost running step of the main agent", () => {
+  const step = (id: string, node: string, ns: string[], parent: string | null = null) => ({
+    step_id: id,
+    node,
+    ...at,
+    ns,
+    parent_tool_call_id: parent,
+  });
+  let m = run(
+    { type: "step_start", ...step("1", "supervisor", []) },
+    { type: "step_start", ...step("2", "model", ["supervisor"]) },
+  );
+  expect(m.step).toBe("model");
+  m = applyEvent(m, { type: "step_end", ...step("2", "model", ["supervisor"]), error: null });
+  expect(m.step).toBe("supervisor");
+  // A subagent's steps don't change the label.
+  m = applyEvent(m, { type: "step_start", ...step("3", "writer", ["supervisor", "tools"], "c1") });
+  expect(m.step).toBe("supervisor");
+  expect(applyEvent(m, { type: "done", status: "complete" }).step).toBeNull();
 });

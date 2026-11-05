@@ -1,16 +1,13 @@
-"""Example agentic graph: a supervisor with tools and one subagent.
+"""Example: a one-node graph whose node is a supervisor agent with tools and a subagent.
 
-    START -> supervisor --(tool calls?)--> tools -> supervisor ... -> END
-                                            |
-                                            +-- calculator, current_time   (plain tools)
-                                            +-- writer                     (subagent graph)
+    START -> supervisor (create_agent: model + tools + middleware) -> END
+                 tools: calculator, current_time, writer (a subagent, also create_agent)
 
-Copy this file as the starting point for your own graph. The app needs only:
-  1. a state with a `messages` key (MessagesState or a subclass),
-  2. the LLM from `get_model(config)` instead of a hard-coded client,
-  3. `config` passed along to subagents (subagent_tool does this for you).
-Export the uncompiled `builder` (the app compiles it with its Postgres checkpointer) or a
-compiled `graph`.
+Add your own tools and middleware to the create_agent calls; add more nodes to `builder`
+when you need steps before or after the supervisor. The app needs only:
+  1. a state with `messages` (MessagesState here),
+  2. UseChatModel() in each agent's middleware, so it runs on the model picked in the UI,
+  3. subagents wrapped with subagent_tool(), so their work shows under the tool call.
 """
 
 import ast
@@ -18,15 +15,13 @@ import operator
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from langchain_core.messages import SystemMessage
-from langchain_core.runnables import RunnableConfig
+from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langgraph.graph import START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
 
-from agentkit import get_model, subagent_tool
+from agentkit import UseChatModel, default_model, subagent_tool
 
-# ------------------------------------------------------------------ plain tools
+# ------------------------------------------------------------------ tools
 
 _OPS = {
     ast.Add: operator.add,
@@ -68,57 +63,46 @@ def current_time(timezone: str = "UTC") -> str:
         return f"Error: unknown timezone {timezone!r}"
 
 
-# ------------------------------------------------------------------ subagent: writer
+# ------------------------------------------------------------------ subagent
 
-WRITER_PROMPT = (
-    "You are a careful writer. Produce exactly the text you are asked for: clear, concise, "
-    "well structured. Return only the finished text."
+writer = create_agent(
+    model=default_model(),
+    system_prompt=(
+        "You are a careful writer. Produce exactly the text you are asked for: clear, "
+        "concise, well structured. Return only the finished text."
+    ),
+    middleware=[UseChatModel()],
+    name="writer",
 )
-
-
-async def writer_node(state: MessagesState, config: RunnableConfig) -> dict:
-    model = get_model(config)
-    reply = await model.ainvoke([SystemMessage(WRITER_PROMPT), *state["messages"]], config)
-    return {"messages": [reply]}
-
-
-writer_builder = StateGraph(MessagesState)
-writer_builder.add_node("writer", writer_node)
-writer_builder.add_edge(START, "writer")
-writer = writer_builder.compile(name="writer")
 
 # ------------------------------------------------------------------ supervisor
 
-TOOLS = [
-    calculator,
-    current_time,
-    subagent_tool(
-        writer,
-        name="writer",
-        description="Delegate drafting or rewriting a piece of text (emails, summaries, "
-        "poems, docs) to a writing specialist. Give it the full brief.",
+supervisor = create_agent(
+    model=default_model(),
+    tools=[
+        calculator,
+        current_time,
+        subagent_tool(
+            writer,
+            name="writer",
+            description="Delegate drafting or rewriting a piece of text (emails, summaries, "
+            "poems, docs) to a writing specialist. Give it the full brief.",
+        ),
+    ],
+    system_prompt=(
+        "You are a helpful assistant that coordinates tools and specialists. Use the "
+        "calculator for arithmetic, current_time for dates and times, and the writer for "
+        "substantial writing tasks. Answer directly when no tool is needed."
     ),
-]
-
-SUPERVISOR_PROMPT = (
-    "You are a helpful assistant that coordinates tools and specialists. Use the calculator "
-    "for arithmetic, current_time for dates and times, and the writer for substantial "
-    "writing tasks. Answer directly when no tool is needed."
+    middleware=[UseChatModel()],  # add yours: SummarizationMiddleware, ModelRetryMiddleware...
+    name="supervisor",
 )
 
-
-async def supervisor(state: MessagesState, config: RunnableConfig) -> dict:
-    model = get_model(config).bind_tools(TOOLS)
-    reply = await model.ainvoke([SystemMessage(SUPERVISOR_PROMPT), *state["messages"]], config)
-    return {"messages": [reply]}
-
+# ------------------------------------------------------------------ the graph
 
 builder = StateGraph(MessagesState)
 builder.add_node("supervisor", supervisor)
-builder.add_node("tools", ToolNode(TOOLS))
 builder.add_edge(START, "supervisor")
-builder.add_conditional_edges("supervisor", tools_condition)
-builder.add_edge("tools", "supervisor")
 
 # Compiled without a checkpointer, for notebooks and `langgraph dev`.
 graph = builder.compile()

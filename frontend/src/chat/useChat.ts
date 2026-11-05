@@ -1,11 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api as defaultApi, type ChatApi } from "../api/client";
 import type { ChatMessage, ModelInfo, Thread } from "../contract";
 import { applyEvent, type LiveMessage } from "./reduce";
 
-const PENDING_USER = "pending-user";
-const PENDING_REPLY = "pending-reply";
 const MODEL_KEY = "chat.model";
 const THINK_KEY = "chat.thinking";
 
@@ -35,21 +33,32 @@ function remember(key: string, value: string): void {
 
 const now = () => new Date().toISOString();
 
+/** A reply being streamed for one chat. It keeps running when the user opens another chat. */
+interface LiveRun {
+  controller: AbortController;
+  user: ChatMessage;
+  reply: LiveMessage;
+  finished: boolean;
+}
+
 export function useChat(api: ChatApi = defaultApi) {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeId, setActiveId] = useState<string | null>(idFromUrl);
-  const [messages, setMessages] = useState<LiveMessage[]>([]);
+  const [history, setHistory] = useState<LiveMessage[]>([]); // saved turns of the open chat
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [model, setModel] = useState<string | null>(null);
   const [thinking, setThinking] = useState(() => stored(THINK_KEY) === "true");
-  const [streaming, setStreaming] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Live runs by thread id. A ref, so background streams never read stale state; `version`
+  // re-renders when one changes.
+  const runs = useRef(new Map<string, LiveRun>());
+  const [version, setVersion] = useState(0);
+  const [reloadKey, setReloadKey] = useState(0);
 
   const activeIdRef = useRef(activeId);
-  const abortRef = useRef<AbortController | null>(null);
-  const streamThreadRef = useRef<string | null>(null);
   const skipLoadRef = useRef<string | null>(null);
+  const bump = useCallback(() => setVersion((v) => v + 1), []);
 
   const navigate = useCallback((id: string | null) => {
     const url = id ? `#/c/${id}` : window.location.pathname + window.location.search;
@@ -80,7 +89,7 @@ export function useChat(api: ChatApi = defaultApi) {
         });
         if (list.models.length === 0) {
           setError(
-            "No models available. Start Ollama and pull a model (ollama pull qwen3:0.6b), " +
+            "No models available. Start Ollama and pull a model (ollama pull qwen3:8b), " +
               "or set OPENAI_API_KEY / ANTHROPIC_API_KEY, then press ↻.",
           );
         }
@@ -96,11 +105,10 @@ export function useChat(api: ChatApi = defaultApi) {
     void loadModels();
   }, [refreshThreads, loadModels]);
 
-  // Back/forward switch chats; leaving a streaming chat stops its reply.
+  // Back/forward switch chats. Replies keep streaming in the background.
   useEffect(() => {
     const onPop = () => {
       const id = idFromUrl();
-      if (id !== streamThreadRef.current) abortRef.current?.abort();
       activeIdRef.current = id;
       setActiveId(id);
     };
@@ -108,13 +116,15 @@ export function useChat(api: ChatApi = defaultApi) {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
+  // Load the open chat's saved turns (again after one of its replies finishes).
   useEffect(() => {
     if (!activeId) {
-      setMessages([]);
+      setHistory([]);
       return;
     }
     if (skipLoadRef.current === activeId) {
-      skipLoadRef.current = null; // just created here; messages are already in state
+      skipLoadRef.current = null; // just created here: nothing saved yet
+      setHistory([]);
       return;
     }
     let cancelled = false;
@@ -123,9 +133,14 @@ export function useChat(api: ChatApi = defaultApi) {
       .thread(activeId)
       .then((detail) => {
         if (cancelled) return;
-        setMessages(detail.messages);
+        setHistory(detail.messages);
         if (detail.model) setModel(detail.model);
         setThinking(detail.thinking);
+        // A finished reply is in the saved turns now; drop its live copy.
+        if (runs.current.get(activeId)?.finished) {
+          runs.current.delete(activeId);
+          bump();
+        }
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -136,11 +151,21 @@ export function useChat(api: ChatApi = defaultApi) {
     return () => {
       cancelled = true;
     };
-  }, [activeId, api, navigate]);
+  }, [activeId, api, navigate, bump, reloadKey]);
+
+  const activeRun = activeId ? runs.current.get(activeId) : undefined;
+  const streaming = Boolean(activeRun && !activeRun.finished);
+  const messages = useMemo(
+    () => (activeRun ? [...history, activeRun.user, activeRun.reply] : history),
+    // `version` changes whenever a run is updated in place.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [history, activeRun, version],
+  );
 
   const send = useCallback(
     async (text: string) => {
-      if (streaming || !model) return;
+      const existing = activeIdRef.current ? runs.current.get(activeIdRef.current) : undefined;
+      if ((existing && !existing.finished) || !model) return;
       setError(null);
       let threadId = activeIdRef.current;
       try {
@@ -155,75 +180,90 @@ export function useChat(api: ChatApi = defaultApi) {
         setError(`Could not start a chat: ${errorText(e)}`);
         return;
       }
-
-      const user: ChatMessage = {
-        id: PENDING_USER,
-        role: "user",
-        created_at: now(),
-        status: "complete",
-        parts: [{ type: "text", text }],
-      };
-      const reply: LiveMessage = {
-        id: PENDING_REPLY,
-        role: "assistant",
-        created_at: now(),
-        status: "streaming",
-        parts: [],
-        model,
-        step: null,
-      };
-      setMessages((list) => [...list, user, reply]);
-
-      const controller = new AbortController();
-      abortRef.current = controller;
-      streamThreadRef.current = threadId;
-      setStreaming(true);
       const current = threadId;
+
+      // A finished reply still shown live belongs in the history before the next turn.
+      if (existing?.finished) {
+        setHistory((list) => [...list, existing.user, existing.reply]);
+      }
+      const run: LiveRun = {
+        controller: new AbortController(),
+        finished: false,
+        user: {
+          id: `pending-user-${Date.now()}`,
+          role: "user",
+          created_at: now(),
+          status: "complete",
+          parts: [{ type: "text", text }],
+        },
+        reply: {
+          id: `pending-reply-${Date.now()}`,
+          role: "assistant",
+          created_at: now(),
+          status: "streaming",
+          parts: [],
+          model,
+          step: null,
+        },
+      };
+      runs.current.set(current, run);
+      bump();
+
       const update = (fn: (m: LiveMessage) => LiveMessage) => {
-        if (activeIdRef.current !== current) return; // the user moved to another chat
-        setMessages((list) => list.map((m) => (m.id === PENDING_REPLY ? fn(m) : m)));
+        run.reply = fn(run.reply);
+        bump();
       };
 
       try {
-        await api.run(current, { content: text, model, thinking }, controller.signal, (event) => {
-          if (event.type === "user_message") {
-            setMessages((list) => list.map((m) => (m.id === PENDING_USER ? event.message : m)));
-          } else if (event.type === "title") {
-            setThreads((list) =>
-              list.map((t) => (t.id === current ? { ...t, title: event.title } : t)),
-            );
-          } else {
-            if (event.type === "error") setError(event.message);
-            update((m) => applyEvent(m, event));
-          }
-        });
+        await api.run(
+          current,
+          { content: text, model, thinking },
+          run.controller.signal,
+          (event) => {
+            if (event.type === "user_message") {
+              run.user = event.message;
+              bump();
+            } else if (event.type === "title") {
+              setThreads((list) =>
+                list.map((t) => (t.id === current ? { ...t, title: event.title } : t)),
+              );
+            } else {
+              if (event.type === "error" && activeIdRef.current === current) {
+                setError(event.message);
+              }
+              update((m) => applyEvent(m, event));
+            }
+          },
+        );
       } catch (e) {
-        if (controller.signal.aborted) {
+        if (run.controller.signal.aborted) {
           update((m) => applyEvent(m, { type: "done", status: "stopped" }));
         } else {
-          setError(errorText(e));
+          if (activeIdRef.current === current) setError(errorText(e));
           update((m) => applyEvent(m, { type: "done", status: "error" }));
         }
       } finally {
-        abortRef.current = null;
-        streamThreadRef.current = null;
-        setStreaming(false);
-        // Give the reply a stable id so a later event can't touch it.
-        setMessages((list) =>
-          list.map((m) => (m.id === PENDING_REPLY ? { ...m, id: `reply-${Date.now()}` } : m)),
-        );
+        run.finished = true;
+        bump();
         void refreshThreads();
+        // Show the saved version of the turn (if the chat is open; otherwise on next open).
+        if (runs.current.get(current) === run) {
+          if (activeIdRef.current === current) setReloadKey((k) => k + 1);
+        }
       }
     },
-    [api, model, navigate, refreshThreads, streaming, thinking],
+    [api, model, navigate, refreshThreads, thinking, bump],
   );
 
-  const stop = useCallback(() => abortRef.current?.abort(), []);
+  /** Stop the reply in the open chat (the user pressed ■). */
+  const stop = useCallback(() => {
+    const id = activeIdRef.current;
+    if (id) runs.current.get(id)?.controller.abort();
+  }, []);
 
   const selectThread = useCallback(
     (id: string | null) => {
       if (id === activeIdRef.current) return;
-      abortRef.current?.abort();
       setError(null);
       navigate(id);
     },
@@ -264,16 +304,23 @@ export function useChat(api: ChatApi = defaultApi) {
 
   const deleteThread = useCallback(
     async (id: string) => {
-      if (id === streamThreadRef.current) abortRef.current?.abort();
+      const run = runs.current.get(id);
+      if (run && !run.finished) {
+        run.controller.abort();
+        // The backend refuses to delete a chat until its run has wound down.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
       try {
         await api.deleteThread(id);
+        runs.current.delete(id);
+        bump();
         setThreads((list) => list.filter((t) => t.id !== id));
         if (activeIdRef.current === id) navigate(null);
       } catch (e) {
         setError(`Could not delete: ${errorText(e)}`);
       }
     },
-    [api, navigate],
+    [api, navigate, bump],
   );
 
   return {

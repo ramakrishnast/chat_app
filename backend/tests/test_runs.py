@@ -28,15 +28,17 @@ async def test_supervisor_tool_subagent_stream(client):
     # The subagent's tokens are nested under the tool call that started it.
     sub = [e for e in events if e["type"] == "text" and e["parent_tool_call_id"] == "call_1"]
     assert "".join(e["delta"] for e in sub) == "Leaves fall softly down"
-    assert {e["agent"] for e in sub} == {"writer"} and sub[0]["ns"][0] == "tools"
+    assert {e["agent"] for e in sub} == {"writer"} and "tools" in sub[0]["ns"]
     result = next(e for e in events if e["type"] == "tool_result")
     assert result["tool_call_id"] == "call_1" and result["content"] == "Leaves fall softly down"
     assert result["status"] == "success"
     assert types.index("tool_call") < types.index("tool_result")
 
-    # Node progress for the root graph.
+    # Node progress: the one root node, and the agent loop inside it.
     roots = [e["node"] for e in events if e["type"] == "step_start" and not e["ns"]]
-    assert roots == ["supervisor", "tools", "supervisor"]
+    assert roots == ["supervisor"]
+    inner = [e["node"] for e in events if e["type"] == "step_start" and e["ns"] == ["supervisor"]]
+    assert inner == ["model", "tools", "model"]
 
 
 async def test_first_turn_sets_title(client):

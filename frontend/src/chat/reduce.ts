@@ -7,7 +7,8 @@ import type { ChatMessage, Part, StreamEvent, ToolPart } from "../contract";
 
 export interface LiveMessage extends ChatMessage {
   model?: string | null;
-  step?: string | null; // top-level node running right now
+  step?: string | null; // innermost node of the main agent running right now
+  running?: { id: string; node: string }[]; // main-agent steps started and not yet ended
   error?: string | null;
 }
 
@@ -97,13 +98,17 @@ export function applyEvent(message: LiveMessage, event: StreamEvent): LiveMessag
         })),
       };
 
-    case "step_start":
-      return event.ns.length === 0 ? { ...message, step: event.node } : message;
+    case "step_start": {
+      if (event.parent_tool_call_id !== null) return message; // a subagent's own steps
+      const running = [...(message.running ?? []), { id: event.step_id, node: event.node }];
+      return { ...message, running, step: event.node };
+    }
 
-    case "step_end":
-      return event.ns.length === 0 && message.step === event.node
-        ? { ...message, step: null }
-        : message;
+    case "step_end": {
+      if (event.parent_tool_call_id !== null) return message;
+      const running = (message.running ?? []).filter((s) => s.id !== event.step_id);
+      return { ...message, running, step: running[running.length - 1]?.node ?? null };
+    }
 
     case "interrupt":
       return {
@@ -118,6 +123,7 @@ export function applyEvent(message: LiveMessage, event: StreamEvent): LiveMessag
       return {
         ...message,
         step: null,
+        running: [],
         status: event.status === "complete" && message.status === "error" ? "error" : event.status,
         parts: finishRunning(message.parts, event.status !== "complete"),
       };

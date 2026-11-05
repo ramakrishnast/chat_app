@@ -66,16 +66,19 @@ Try "Write a poem about rivers" (supervisor → writer subagent) or "What is 17 
 
 ## Plugging in your graph
 
-Point `GRAPH` in `.env` at it. The full guide is [docs/your-graph.md](docs/your-graph.md);
-in short: a `messages` state, the LLM from `get_model(config)`, `config` passed along, and
-subagents wrapped with `subagent_tool(...)`.
+Point `GRAPH` in `.env` at it. The shape is a one-node graph whose node is a
+`create_agent` supervisor carrying your tools and middleware; see
+[docs/your-graph.md](docs/your-graph.md).
 
 ```python
-from agentkit import get_model, subagent_tool
-
-async def supervisor(state: MessagesState, config: RunnableConfig) -> dict:
-    reply = await get_model(config).bind_tools(TOOLS).ainvoke(state["messages"], config)
-    return {"messages": [reply]}
+supervisor = create_agent(
+    model=default_model(),
+    tools=[calculator, subagent_tool(writer, name="writer", description="...")],
+    middleware=[UseChatModel()],   # + your middleware
+)
+builder = StateGraph(MessagesState)
+builder.add_node("supervisor", supervisor)
+builder.add_edge(START, "supervisor")
 ```
 
 ## Models and keys
@@ -105,8 +108,8 @@ All settings live in `.env`; see `.env.example` for every option. The important 
 
 ```
 backend/
-  agentkit/          get_model(config), subagent_tool(...)  ← import these in your graph
-  agents/example/    example supervisor + tools + writer subagent
+  agentkit/          UseChatModel, subagent_tool, get_model  ← import these in your graph
+  agents/example/    one-node graph: create_agent supervisor + tools + writer subagent
   app/
     main.py          FastAPI app, REST routes, lifespan (checkpointer, store, graph)
     runs.py          one turn: astream → SSE, stop/err handling
