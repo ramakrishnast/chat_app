@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from fastapi import Body, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
@@ -60,7 +61,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 open=False,
                 kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
             )
-            await pool.open(wait=True, timeout=10)
+            try:
+                await pool.open(wait=True, timeout=10)
+            except Exception as exc:
+                await pool.close()
+                where = settings.database_url.rsplit("@", 1)[-1]  # host:port/db, no password
+                raise RuntimeError(
+                    f"Can't reach Postgres at {where}. Start it with `docker compose up -d "
+                    "--wait postgres`, and check that the port in DATABASE_URL matches "
+                    "POSTGRES_PORT in .env (or empty DATABASE_URL to keep chats in memory)."
+                ) from exc
             checkpointer: Any = AsyncPostgresSaver(pool)  # type: ignore[arg-type]
             await checkpointer.setup()
             store: ThreadStore = PostgresThreadStore(pool)
@@ -216,6 +226,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # No proxy buffering, so tokens reach the browser as they are generated.
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # One-process deployment: serve the built UI from the same origin as the API. Mounted
+    # last so /api and /health win. The UI routes with #/c/<id>, so no SPA fallback is needed.
+    if (settings.frontend_dist / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=settings.frontend_dist, html=True), name="ui")
 
     return app
 

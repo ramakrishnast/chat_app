@@ -1,7 +1,8 @@
 # Recipes start with ">" instead of a tab.
 .RECIPEPREFIX = >
 .DEFAULT_GOAL := help
-TEST_DB ?= postgresql://chat:chat@localhost:5432/chat_test
+TEST_DB ?= postgresql://chat:chat@localhost:5433/chat_test
+PORT ?= 8000
 
 help: ## List commands
 > @grep -E '^[a-z-]+:.*## ' Makefile | awk -F ':.*## ' '{ printf "  make %-14s %s\n", $$1, $$2 }'
@@ -22,6 +23,10 @@ backend: ## API on http://127.0.0.1:8000 (reloads on change)
 
 frontend: ## UI on http://localhost:5173
 > cd frontend && npm run dev
+
+start: ## Build the UI, then serve UI + API from one server on http://127.0.0.1:$(PORT)
+> cd frontend && npm run build
+> cd backend && uv run uvicorn app.main:app --host 127.0.0.1 --port $(PORT)
 
 dev: ## Backend and frontend together
 > $(MAKE) -j2 backend frontend
@@ -45,4 +50,4 @@ format: ## Auto-format everything
 > cd backend && uv run ruff format . && uv run ruff check --fix .
 > cd frontend && npm run format
 
-.PHONY: help setup db-up db-down backend frontend dev demo demo-backend test lint format
+.PHONY: help setup db-up db-down backend frontend start dev demo demo-backend test lint format

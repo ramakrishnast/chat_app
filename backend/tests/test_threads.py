@@ -37,3 +37,19 @@ async def test_models_and_info(client):
     info = (await client.get("/api/info")).json()
     assert info["protocol"] == 1 and info["graph"] == "agents.example.graph:builder"
     assert (await client.get("/health")).json() == {"status": "ok"}
+
+
+async def test_serves_built_ui_next_to_the_api(tmp_path, model):
+    import httpx
+
+    from app.main import create_app
+    from tests.conftest import make_settings
+
+    (tmp_path / "index.html").write_text("<div id=root></div>")
+    app = create_app(make_settings(frontend_dist=tmp_path))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            assert "id=root" in (await c.get("/")).text
+            assert (await c.get("/health")).json() == {"status": "ok"}
+            assert (await c.get("/api/threads")).json() == []

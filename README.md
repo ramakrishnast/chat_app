@@ -31,15 +31,38 @@ Postgres 16: LangGraph checkpoints (the conversations) + chat list
 Prerequisites: [uv](https://docs.astral.sh/uv/), Node 20+, Docker (for Postgres), and
 [Ollama](https://ollama.com) with a model that supports tools, e.g. `ollama pull qwen3:8b`.
 
+### Run it (one server: FastAPI + uvicorn + Postgres)
+
 ```bash
-make setup      # .env from .env.example, Python + npm dependencies
-make db-up      # Postgres in Docker
-make dev        # API on :8000, UI on http://localhost:5173
+cp .env.example .env
+cd backend && uv sync && cd ..
+cd frontend && npm install && npm run build && cd ..
+docker compose up -d --wait postgres
+cd backend && uv run uvicorn app.main:app --port 8000
 ```
+
+Open http://127.0.0.1:8000. FastAPI serves the built UI and the API from the same port
+(`make start` does the build and the uvicorn step). Rebuild the UI after frontend changes.
+
+### Develop (hot reload)
+
+`make dev` runs uvicorn with `--reload` on :8000 and Vite on http://localhost:5173, which
+proxies `/api` to the backend.
 
 No Ollama yet? `make demo` runs everything with an offline demo model and in-memory storage.
 Try "Write a poem about rivers" (supervisor → writer subagent) or "What is 17 * 23?"
 (calculator tool).
+
+### Troubleshooting
+
+- **`port is already allocated` from docker compose**: another Postgres (for example
+  chatbot-vanilla's) uses that port. This app defaults to **5433**; pick another free port
+  with `POSTGRES_PORT` in `.env` and use the same port in `DATABASE_URL`.
+- **`[Errno 48] Address already in use`**: something already listens on 8000. See what with
+  `lsof -i :8000`, stop it, or run on another port (`--port 8001`, or `make start PORT=8001`).
+- **"Can't reach Postgres at …" on startup**: Postgres isn't running or the port in
+  `DATABASE_URL` is wrong. Empty `DATABASE_URL=` keeps chats in memory instead.
+- **No models in the picker**: start the Ollama app and `ollama pull qwen3:8b`, then press ↻.
 
 ## Plugging in your graph
 
@@ -69,7 +92,7 @@ Keys stay on the server; the browser only sees model ids. Think maps to Ollama
 
 ## Commands
 
-Run `make` to list them: `dev`, `demo`, `test`, `lint`, `format`, `db-up`, `db-down`.
+Run `make` to list them: `start`, `dev`, `demo`, `test`, `lint`, `format`, `db-up`, `db-down`.
 
 ## Configuration
 

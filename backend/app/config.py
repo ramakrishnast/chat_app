@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # --- server ----------------------------------------------------------------------------
     cors_origins: CsvList = ["http://localhost:5173", "http://127.0.0.1:5173"]
     log_level: str = "INFO"
+    # Built UI (`npm run build`). When it exists, the API serves it at "/" so the whole app
+    # runs as one uvicorn process; in development Vite serves the UI instead.
+    frontend_dist: Path = REPO_DIR / "frontend" / "dist"
 
     @field_validator(
         "graph_pythonpath", "openai_models", "anthropic_models", "cors_origins", mode="before"
