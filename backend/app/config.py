@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     anthropic_models: CsvList = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
     # Offer the offline `fake:echo` model (UI work without Ollama or an API key).
     enable_fake_model: bool = False
+    # Seconds between the demo model's streamed words (raise it to try slow replies).
+    fake_model_delay: float = Field(default=0.03, ge=0)
     # Token budget for Anthropic extended thinking when the Think toggle is on.
     anthropic_thinking_budget: int = Field(default=4096, ge=1024)
     # Seconds allowed between streamed tokens (large local models load slowly).

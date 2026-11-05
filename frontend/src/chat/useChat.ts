@@ -128,13 +128,6 @@ export function useChat(api: ChatApi = defaultApi) {
         await open(run.controller.signal, (event) => {
           if (event.type === "user_message") {
             run.user = event.message;
-            // Re-attaching: the saved turns may already start this turn; the live copy wins.
-            if (activeIdRef.current === threadId) {
-              setHistory((list) => {
-                const index = list.findIndex((m) => m.id === event.message.id);
-                return index >= 0 ? list.slice(0, index) : list;
-              });
-            }
           } else if (event.type === "title") {
             setThreads((list) =>
               list.map((t) => (t.id === threadId ? { ...t, title: event.title } : t)),
@@ -238,7 +231,14 @@ export function useChat(api: ChatApi = defaultApi) {
   const activeRun = activeId ? runs.current.get(activeId) : undefined;
   const streaming = Boolean(activeRun && !activeRun.finished);
   const messages = useMemo(
-    () => (activeRun ? [...history, activeRun.user, activeRun.reply] : history),
+    () => {
+      if (!activeRun) return history;
+      // The server saves the user's message as soon as a reply starts, so a history loaded
+      // mid-reply already has it (and any finished part of the turn): the live copy wins.
+      const index = history.findIndex((m) => m.id === activeRun.user.id);
+      const saved = index >= 0 ? history.slice(0, index) : history;
+      return [...saved, activeRun.user, activeRun.reply];
+    },
     // `version` changes whenever a run is updated in place.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [history, activeRun, version],

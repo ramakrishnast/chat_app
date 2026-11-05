@@ -195,4 +195,6 @@ def _build(model_id: str, thinking: bool) -> BaseChatModel:
     # fake
     from app.fake_model import ScriptedChatModel
 
-    return ScriptedChatModel(thinking="Let me think about that." if thinking else "", delay=0.03)
+    return ScriptedChatModel(
+        thinking="Let me think about that." if thinking else "", delay=s.fake_model_delay
+    )
