@@ -1,0 +1,42 @@
+[project]
+name = "chat-backend"
+version = "0.1.0"
+description = "FastAPI backend that streams any LangGraph graph to a chat UI"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+    "httpx>=0.28",
+    "langgraph>=0.6",
+    "langgraph-checkpoint-postgres>=2.0",
+    "psycopg[binary,pool]>=3.2",
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    "langchain-ollama>=0.3",
+    "langchain-openai>=0.3",
+    "langchain-anthropic>=0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
