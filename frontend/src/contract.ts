@@ -66,6 +66,7 @@ export interface ChatMessage {
 
 export interface ThreadDetail extends Thread {
   messages: ChatMessage[];
+  running: boolean; // a reply is being generated right now (re-attach with watchRun)
 }
 
 export interface RunRequest {

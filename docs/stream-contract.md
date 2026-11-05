@@ -12,10 +12,12 @@ mirrors it in TypeScript; nothing else in the UI knows about LangGraph.
 | GET | `/api/models?refresh=true` | | `{models: ModelInfo[], default}` |
 | GET | `/api/threads` | | `Thread[]`, most recently used first |
 | POST | `/api/threads` | `{title?, model?, thinking?}` | `Thread` (201) |
-| GET | `/api/threads/{id}` | | `Thread & {messages: ChatMessage[]}` |
+| GET | `/api/threads/{id}` | | `Thread & {messages: ChatMessage[], running}` |
 | PATCH | `/api/threads/{id}` | `{title?, model?, thinking?}` | `Thread` |
 | DELETE | `/api/threads/{id}` | | 204 (also deletes the LangGraph checkpoints) |
 | POST | `/api/threads/{id}/runs` | `{content, model?, thinking?}` | `text/event-stream` |
+| GET | `/api/threads/{id}/runs/live` | | `text/event-stream` of the running reply, or 204 |
+| POST | `/api/threads/{id}/runs/stop` | | `{stopped: bool}` |
 
 Errors are JSON `{"detail": "..."}`: 400 bad model id, 404 unknown thread, 409 a reply is
 already streaming in that thread, 503 no model available.
@@ -43,10 +45,16 @@ text, every tool call and its result, and the final answer.
 
 ## Run events
 
-`POST /api/threads/{id}/runs` streams Server-Sent Events. Each event has
-`event: <type>` and `data: <json>`; the JSON repeats `type`. To stop, close the
-connection: the backend cancels the graph, keeps the text streamed so far as a `stopped`
-message, and gives any unfinished tool call an error result, so the thread stays valid.
+`POST /api/threads/{id}/runs` starts a reply and streams it as Server-Sent Events. Each
+event has `event: <type>` and `data: <json>`; the JSON repeats `type`.
+
+The reply runs on the server, not in the request: closing the connection (switching chats,
+reloading, closing the tab) only stops watching, and the reply still finishes and is saved.
+`GET …/runs/live` re-attaches: it replays every event of the running reply from
+`run_start`, then continues live (`running: true` on the thread says when to call it).
+`POST …/runs/stop` stops the reply: the text so far is kept as a `stopped` message, any
+unfinished tool call gets an error result so the thread stays valid, and the stream ends
+with `done` / `stopped`. Delete also stops a running reply.
 
 Events that come from inside the graph say where they came from:
 

@@ -144,3 +144,95 @@ async def stream_run(
             yield sse({"type": "title", "title": title})
     await store.update(thread_id)  # bump updated_at
     yield sse({"type": "done", "status": status})
+
+
+# ------------------------------------------------------------------ background runs
+
+
+class LiveRun:
+    """A reply running in the background. Browsers subscribe to it; leaving doesn't stop it."""
+
+    def __init__(self, thread_id: str) -> None:
+        self.thread_id = thread_id
+        self.events: list[str] = []  # every SSE chunk so far, replayed to late subscribers
+        self.done = False
+        self.task: asyncio.Task[None] | None = None
+        self._queues: set[asyncio.Queue[str | None]] = set()
+
+    def publish(self, chunk: str) -> None:
+        self.events.append(chunk)
+        for queue in self._queues:
+            queue.put_nowait(chunk)
+
+    def finish(self) -> None:
+        self.done = True
+        for queue in self._queues:
+            queue.put_nowait(None)
+
+    async def subscribe(self) -> AsyncIterator[str]:
+        """Everything so far, then live events until the run ends. Safe to abandon."""
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        backlog, finished = list(self.events), self.done
+        if not finished:
+            self._queues.add(queue)
+        try:
+            for chunk in backlog:
+                yield chunk
+            if finished:
+                return
+            while (chunk := await queue.get()) is not None:
+                yield chunk
+        finally:
+            self._queues.discard(queue)
+
+
+class RunManager:
+    """At most one running reply per thread, independent of any HTTP connection."""
+
+    def __init__(self) -> None:
+        self._runs: dict[str, LiveRun] = {}
+        self.active: set[str] = set()  # threads whose graph is executing (used by stream_run)
+
+    def get(self, thread_id: str) -> LiveRun | None:
+        run = self._runs.get(thread_id)
+        return run if run and not run.done else None
+
+    def start(self, thread_id: str, events: AsyncIterator[str]) -> LiveRun:
+        run = LiveRun(thread_id)
+        self._runs[thread_id] = run
+
+        async def produce() -> None:
+            try:
+                async for chunk in events:
+                    run.publish(chunk)
+            except asyncio.CancelledError:
+                # stop(): stream_run has already saved the partial reply.
+                run.publish(sse({"type": "done", "status": "stopped"}))
+            except Exception as exc:
+                log.exception("run failed", extra={"thread_id": thread_id})
+                run.publish(sse({"type": "error", "message": str(exc) or type(exc).__name__}))
+                run.publish(sse({"type": "done", "status": "error"}))
+            finally:
+                run.finish()
+                if self._runs.get(thread_id) is run:
+                    del self._runs[thread_id]
+
+        run.task = asyncio.create_task(produce(), name=f"run:{thread_id}")
+        return run
+
+    async def stop(self, thread_id: str) -> bool:
+        run = self.get(thread_id)
+        if run is None or run.task is None:
+            return False
+        run.task.cancel()
+        await asyncio.wait([run.task])
+        if not run.done:  # cancelled before it started: its cleanup never ran
+            run.publish(sse({"type": "done", "status": "stopped"}))
+            run.finish()
+            if self._runs.get(thread_id) is run:
+                del self._runs[thread_id]
+        return True
+
+    async def shutdown(self) -> None:
+        for thread_id in list(self._runs):
+            await self.stop(thread_id)

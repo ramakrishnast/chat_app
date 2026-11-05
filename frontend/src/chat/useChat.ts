@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api as defaultApi, type ChatApi } from "../api/client";
-import type { ChatMessage, ModelInfo, Thread } from "../contract";
+import type { ChatMessage, ModelInfo, StreamEvent, Thread } from "../contract";
 import { applyEvent, type LiveMessage } from "./reduce";
 
 const MODEL_KEY = "chat.model";
@@ -33,7 +33,8 @@ function remember(key: string, value: string): void {
 
 const now = () => new Date().toISOString();
 
-/** A reply being streamed for one chat. It keeps running when the user opens another chat. */
+/** A reply being shown for one chat. The reply itself runs on the server, so switching chats,
+ * reloading or closing the tab doesn't stop it; this is only the browser's view of it. */
 interface LiveRun {
   controller: AbortController;
   user: ChatMessage;
@@ -116,6 +117,83 @@ export function useChat(api: ChatApi = defaultApi) {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
+  /** Show a reply's events in `run` until its stream ends, then reload the saved turns. */
+  const follow = useCallback(
+    async (
+      threadId: string,
+      run: LiveRun,
+      open: (signal: AbortSignal, onEvent: (event: StreamEvent) => void) => Promise<unknown>,
+    ) => {
+      try {
+        await open(run.controller.signal, (event) => {
+          if (event.type === "user_message") {
+            run.user = event.message;
+            // Re-attaching: the saved turns may already start this turn; the live copy wins.
+            if (activeIdRef.current === threadId) {
+              setHistory((list) => {
+                const index = list.findIndex((m) => m.id === event.message.id);
+                return index >= 0 ? list.slice(0, index) : list;
+              });
+            }
+          } else if (event.type === "title") {
+            setThreads((list) =>
+              list.map((t) => (t.id === threadId ? { ...t, title: event.title } : t)),
+            );
+          } else {
+            if (event.type === "error" && activeIdRef.current === threadId) {
+              setError(event.message);
+            }
+            run.reply = applyEvent(run.reply, event);
+          }
+          bump();
+        });
+      } catch (e) {
+        if (run.controller.signal.aborted) return; // the chat was deleted
+        // Only the connection broke; the reply goes on on the server, and reopening the chat
+        // re-attaches to it.
+        if (activeIdRef.current === threadId) setError(`Lost the live view: ${errorText(e)}`);
+      } finally {
+        run.finished = true;
+        bump();
+        void refreshThreads();
+        // Swap the live copy for the saved turns (now if the chat is open, else on next open).
+        if (runs.current.get(threadId) === run && activeIdRef.current === threadId) {
+          setReloadKey((k) => k + 1);
+        }
+      }
+    },
+    [bump, refreshThreads],
+  );
+
+  /** Show the reply already running in a chat that was just opened. */
+  const attach = useCallback(
+    (threadId: string) => {
+      const run: LiveRun = {
+        controller: new AbortController(),
+        finished: false,
+        user: {
+          id: `live-user-${threadId}`,
+          role: "user",
+          created_at: null,
+          status: "complete",
+          parts: [],
+        },
+        reply: {
+          id: `live-reply-${threadId}`,
+          role: "assistant",
+          created_at: now(),
+          status: "streaming",
+          parts: [],
+          step: null,
+        },
+      };
+      runs.current.set(threadId, run);
+      bump();
+      void follow(threadId, run, (signal, onEvent) => api.watchRun(threadId, signal, onEvent));
+    },
+    [api, bump, follow],
+  );
+
   // Load the open chat's saved turns (again after one of its replies finishes).
   useEffect(() => {
     if (!activeId) {
@@ -137,10 +215,14 @@ export function useChat(api: ChatApi = defaultApi) {
         if (detail.model) setModel(detail.model);
         setThinking(detail.thinking);
         // A finished reply is in the saved turns now; drop its live copy.
-        if (runs.current.get(activeId)?.finished) {
+        const local = runs.current.get(activeId);
+        if (local?.finished) {
           runs.current.delete(activeId);
           bump();
         }
+        // A reply still running on the server (started in another tab, before a reload,
+        // or the live view dropped): pick it up.
+        if (detail.running && (!local || local.finished)) attach(activeId);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -151,7 +233,7 @@ export function useChat(api: ChatApi = defaultApi) {
     return () => {
       cancelled = true;
     };
-  }, [activeId, api, navigate, bump, reloadKey]);
+  }, [activeId, api, navigate, bump, attach, reloadKey]);
 
   const activeRun = activeId ? runs.current.get(activeId) : undefined;
   const streaming = Boolean(activeRun && !activeRun.finished);
@@ -209,57 +291,19 @@ export function useChat(api: ChatApi = defaultApi) {
       runs.current.set(current, run);
       bump();
 
-      const update = (fn: (m: LiveMessage) => LiveMessage) => {
-        run.reply = fn(run.reply);
-        bump();
-      };
-
-      try {
-        await api.run(
-          current,
-          { content: text, model, thinking },
-          run.controller.signal,
-          (event) => {
-            if (event.type === "user_message") {
-              run.user = event.message;
-              bump();
-            } else if (event.type === "title") {
-              setThreads((list) =>
-                list.map((t) => (t.id === current ? { ...t, title: event.title } : t)),
-              );
-            } else {
-              if (event.type === "error" && activeIdRef.current === current) {
-                setError(event.message);
-              }
-              update((m) => applyEvent(m, event));
-            }
-          },
-        );
-      } catch (e) {
-        if (run.controller.signal.aborted) {
-          update((m) => applyEvent(m, { type: "done", status: "stopped" }));
-        } else {
-          if (activeIdRef.current === current) setError(errorText(e));
-          update((m) => applyEvent(m, { type: "done", status: "error" }));
-        }
-      } finally {
-        run.finished = true;
-        bump();
-        void refreshThreads();
-        // Show the saved version of the turn (if the chat is open; otherwise on next open).
-        if (runs.current.get(current) === run) {
-          if (activeIdRef.current === current) setReloadKey((k) => k + 1);
-        }
-      }
+      await follow(current, run, (signal, onEvent) =>
+        api.run(current, { content: text, model, thinking }, signal, onEvent),
+      );
     },
-    [api, model, navigate, refreshThreads, thinking, bump],
+    [api, model, navigate, thinking, bump, follow],
   );
 
-  /** Stop the reply in the open chat (the user pressed ■). */
+  /** Stop the reply in the open chat (the user pressed ■). The server ends the stream with
+   * done/stopped, which the live view shows like any other event. */
   const stop = useCallback(() => {
     const id = activeIdRef.current;
-    if (id) runs.current.get(id)?.controller.abort();
-  }, []);
+    if (id) void api.stopRun(id).catch((e: unknown) => setError(`Could not stop: ${errorText(e)}`));
+  }, [api]);
 
   const selectThread = useCallback(
     (id: string | null) => {
@@ -304,14 +348,9 @@ export function useChat(api: ChatApi = defaultApi) {
 
   const deleteThread = useCallback(
     async (id: string) => {
-      const run = runs.current.get(id);
-      if (run && !run.finished) {
-        run.controller.abort();
-        // The backend refuses to delete a chat until its run has wound down.
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      }
       try {
-        await api.deleteThread(id);
+        await api.deleteThread(id); // also stops a reply running there
+        runs.current.get(id)?.controller.abort();
         runs.current.delete(id);
         bump();
         setThreads((list) => list.filter((t) => t.id !== id));

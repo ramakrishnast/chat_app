@@ -17,7 +17,7 @@ async def start(client, thread_id, content="go"):
         thinking=False,
         first_turn=False,
         placeholder_title="x",
-        active=app.state.active_runs,
+        active=app.state.runs.active,
     )
 
 
@@ -36,7 +36,7 @@ async def test_stop_mid_answer_keeps_partial_text(client, script, model):
     thread_id = await new_thread(client)
     stream = await start(client, thread_id)
     await stop_after(stream, lambda e: e["type"] == "text" and "three" in e["delta"])
-    assert thread_id not in client.app.state.active_runs
+    assert thread_id not in client.app.state.runs.active
 
     detail = (await client.get(f"/api/threads/{thread_id}")).json()
     assistant = detail["messages"][1]

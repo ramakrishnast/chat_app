@@ -13,7 +13,7 @@ from app.config import Settings, get_settings
 from app.graph_loader import load_graph
 from app.history import first_seen, to_chat_messages
 from app.llm import ModelCatalog, ModelError, split_model_id
-from app.runs import run_config, stream_run
+from app.runs import RunManager, run_config, stream_run
 from app.store import DEFAULT_TITLE, MemoryThreadStore, PostgresThreadStore, ThreadStore
 from app.streaming import PROTOCOL_VERSION
 from app.titles import fallback_title
@@ -39,6 +39,15 @@ class RunCreate(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     model: str | None = Field(default=None, max_length=200)
     thinking: bool | None = None
+
+
+def _sse_response(events: Any) -> StreamingResponse:
+    return StreamingResponse(
+        events,
+        media_type="text/event-stream",
+        # No proxy buffering, so tokens reach the browser as they are generated.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -84,16 +93,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.checkpointer = checkpointer
         app.state.store = store
         app.state.graph = await load_graph(settings.graph, checkpointer, settings.graph_pythonpath)
-        app.state.active_runs = set()
         log.info("ready: graph %s, storage %s", settings.graph, "postgres" if pool else "memory")
         try:
             yield
         finally:
+            await app.state.runs.shutdown()
             if pool is not None:
                 await pool.close()
 
     app = FastAPI(title="LangGraph Chat API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+    app.state.runs = RunManager()
     app.state.catalog = ModelCatalog(settings)
     app.add_middleware(
         CORSMiddleware,
@@ -158,7 +168,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state = await graph.aget_state(config)
         messages = (state.values or {}).get("messages") or []
         timestamps = await first_seen(graph, config)
-        return {**thread.as_dict(), "messages": to_chat_messages(messages, timestamps)}
+        return {
+            **thread.as_dict(),
+            "messages": to_chat_messages(messages, timestamps),
+            "running": request.app.state.runs.get(thread_id) is not None,
+        }
 
     @app.patch("/api/threads/{thread_id}")
     async def update_thread(request: Request, thread_id: str, body: ThreadUpdate) -> dict[str, Any]:
@@ -177,8 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.delete("/api/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
     async def delete_thread(request: Request, thread_id: str) -> Response:
         await thread_or_404(request, thread_id)
-        if thread_id in request.app.state.active_runs:
-            raise HTTPException(status.HTTP_409_CONFLICT, "Stop the running reply first")
+        await request.app.state.runs.stop(thread_id)
         await request.app.state.checkpointer.adelete_thread(thread_id)
         await store_of(request).delete(thread_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -191,7 +204,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> StreamingResponse:
         """Send a user message and stream the graph's reply as Server-Sent Events."""
         thread = await thread_or_404(request, thread_id)
-        if thread_id in request.app.state.active_runs:
+        runs: RunManager = request.app.state.runs
+        if runs.get(thread_id):
             raise HTTPException(status.HTTP_409_CONFLICT, "A reply is already streaming here")
         catalog: ModelCatalog = request.app.state.catalog
         model_id = body.model or thread.model or await catalog.default()
@@ -210,7 +224,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await store_of(request).update(
             thread_id, model=model_id, thinking=thinking, title=placeholder if first_turn else None
         )
-        return StreamingResponse(
+        # The reply runs in the background: it finishes and is saved even if this request's
+        # connection drops (chat switch, reload, closed tab). This response just watches it.
+        run = runs.start(
+            thread_id,
             stream_run(
                 graph=graph,
                 store=store_of(request),
@@ -220,12 +237,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 thinking=thinking,
                 first_turn=first_turn,
                 placeholder_title=placeholder,
-                active=request.app.state.active_runs,
+                active=runs.active,
             ),
-            media_type="text/event-stream",
-            # No proxy buffering, so tokens reach the browser as they are generated.
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+        return _sse_response(run.subscribe())
+
+    @app.get("/api/threads/{thread_id}/runs/live", response_model=None)
+    async def watch_run(request: Request, thread_id: str) -> Response:
+        """Re-attach to the reply running in this thread (events so far, then live).
+        204 when nothing is running."""
+        await thread_or_404(request, thread_id)
+        run = request.app.state.runs.get(thread_id)
+        if run is None:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return _sse_response(run.subscribe())
+
+    @app.post("/api/threads/{thread_id}/runs/stop")
+    async def stop_run(request: Request, thread_id: str) -> dict[str, bool]:
+        """Stop the running reply; the text so far is kept as a stopped message."""
+        await thread_or_404(request, thread_id)
+        return {"stopped": await request.app.state.runs.stop(thread_id)}
 
     # One-process deployment: serve the built UI from the same origin as the API. Mounted
     # last so /api and /health win. The UI routes with #/c/<id>, so no SPA fallback is needed.

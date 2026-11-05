@@ -33,13 +33,23 @@ export interface ChatApi {
     changes: { title?: string; model?: string; thinking?: boolean },
   ): Promise<Thread>;
   deleteThread(id: string): Promise<void>;
-  /** Start a run; resolves when the stream ends. Aborting `signal` stops the reply. */
+  /** Start a reply and watch it until it ends. The reply runs on the server: aborting
+   * `signal` only stops watching. Use stopRun to stop the reply itself. */
   run(
     threadId: string,
     body: RunRequest,
     signal: AbortSignal,
     onEvent: (event: StreamEvent) => void,
   ): Promise<void>;
+  /** Re-attach to the reply running in a thread (events so far, then live).
+   * Resolves false at once when nothing is running. */
+  watchRun(
+    threadId: string,
+    signal: AbortSignal,
+    onEvent: (event: StreamEvent) => void,
+  ): Promise<boolean>;
+  /** Stop the reply running in a thread; the text so far is kept. */
+  stopRun(threadId: string): Promise<{ stopped: boolean }>;
 }
 
 export function createHttpApi(baseUrl = ""): ChatApi {
@@ -73,6 +83,19 @@ export function createHttpApi(baseUrl = ""): ChatApi {
       }
       for await (const event of parseSse<StreamEvent>(response.body)) onEvent(event);
     },
+    async watchRun(threadId, signal, onEvent) {
+      const response = await fetch(`${root}/api/threads/${threadId}/runs/live`, {
+        headers: { Accept: "text/event-stream" },
+        signal,
+      });
+      if (response.status === 204) return false;
+      if (!response.ok || !response.body) {
+        throw new ApiError(response.status, await errorDetail(response));
+      }
+      for await (const event of parseSse<StreamEvent>(response.body)) onEvent(event);
+      return true;
+    },
+    stopRun: (threadId) => request(`/api/threads/${threadId}/runs/stop`, { method: "POST" }),
   };
 }
 
